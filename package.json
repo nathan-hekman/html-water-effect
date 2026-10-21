@@ -1,7 +1,7 @@
 {
-  "name": "web-ocean",
+  "name": "html-water-effect",
   "version": "1.0.0",
-  "description": "Real-time WebGPU ocean renderer: FFT waves, whitecaps, physically based sunset sky.",
+  "description": "Mobile-optimized WebGPU ocean effect with FFT waves, whitecaps, touch controls, and self-contained HTML builds.",
   "license": "MIT",
   "private": true,
   "type": "module",

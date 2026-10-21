@@ -1,4 +1,6 @@
 node_modules/
+.playwright-cli/
+output/
 # local screenshot captures written by server.mjs (/__shot) and test shots
 shots/
 # local tooling
@@ -9,3 +11,11 @@ Thumbs.db
 .vscode/
 .idea/
 *.log
+
+# Deployment staging and local credentials
+sites/
+.env
+.env.*
+!.env.example
+*.pem
+*.key

@@ -75,7 +75,7 @@ struct VSOut {
   for (var c = 0u; c < ${CASCADES}u; c++) {
     let texel = F.cascL[c >> 2u][c & 3u] / TEX_N;
     let lod = log2(max(eff / texel, 1.0)) + 0.5;
-    if (lod < 8.0) {
+    if (lod < ${Math.log2(N)}.0) {
       disp += textureSampleLevel(dispTex, sampR, xz * F.cascInvL[c >> 2u][c & 3u], c, lod).xyz;
     }
   }

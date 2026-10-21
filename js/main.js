@@ -1,8 +1,8 @@
 // WebGPU ocean — custom renderer.
-// FFT ocean (5 cascades) + CDLOD surface mesh + physically based sky + HDR post.
-// All per-frame data lives in preallocated typed arrays / descriptors (no per-frame garbage
-// apart from the unavoidable swap-chain view and command buffer objects).
-import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
+// FFT ocean + CDLOD surface mesh + physically based sky + HDR post.
+// Large per-frame data lives in preallocated typed arrays / descriptors. WebGPU handles
+// and queue-completion promises remain transient.
+import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS, MOBILE } from './wgsl/common.js';
 import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIPS, FOAM_UPDATE, ARRAY16_MIPS, FOAM_RES } from './wgsl/sim.js';
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
 import { OCEAN, SKY_BG, HEIGHT_PROBE } from './wgsl/ocean.js';
@@ -11,8 +11,8 @@ import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 const qs = new URLSearchParams(location.search);
 const DBG = Number(qs.get('dbg')) || 0;
 const D2R = Math.PI / 180;
-const GU = GPUBufferUsage;
-const TU = GPUTextureUsage;
+const GU = globalThis.GPUBufferUsage;
+const TU = globalThis.GPUTextureUsage;
 
 // ----------------------------------------------------------------------------------------
 // Tunable parameters (UI panel edits these)
@@ -64,14 +64,22 @@ function mat4Mul(out, a, b) {
 }
 
 async function main() {
-  if (!navigator.gpu) fail('WebGPU is not available in this browser.');
+  if (!isSecureContext) fail('WebGPU needs a secure connection. Open this page over HTTPS (or localhost on this device).');
+  if (!navigator.gpu) fail('WebGPU is not available. Use a browser and device with WebGPU support. Update Safari or Chrome, then try again.');
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter found.');
   const hasTS = adapter.features.has('timestamp-query');
   const device = await adapter.requestDevice({
     requiredFeatures: hasTS ? ['timestamp-query'] : [],
   });
-  device.lost.then((i) => log('device lost: ' + i.message));
+  let stopped = false;
+  device.lost.then((i) => {
+    stopped = true;
+    const el = document.getElementById('err');
+    el.style.display = 'block';
+    el.textContent = 'Graphics device lost. Reload this page to restart.\n' + i.message;
+    log('device lost: ' + i.message);
+  });
   device.onuncapturederror = (e) => log('GPU error: ' + e.error.message);
 
   const canvas = document.getElementById('c');
@@ -224,7 +232,7 @@ async function main() {
   });
   const sampRepeat = device.createSampler({
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
-    addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
+    addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: MOBILE ? 4 : 16,
   });
   const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
   const sunVisBuf = mkBuf(16, GU.STORAGE, 'sun visibility');
@@ -243,7 +251,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Render pipelines
   // --------------------------------------------------------------------------------------
-  const MSAA = 4;
+  const MSAA = MOBILE ? 1 : 4;
   const HDR = 'rgba16float';
   const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
@@ -307,7 +315,7 @@ async function main() {
   const onProbeFail = () => { probePending = false; };
 
   // CDLOD grid mesh
-  const GRID = 32;
+  const GRID = MOBILE ? 16 : 32;
   const LEAF = 2.0;           // finest node size (m) -> 6.25 cm vertex spacing
   const R0 = 8 * LEAF;        // LOD 0 range
   const LODS = 17;
@@ -332,7 +340,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Screen-size dependent targets
   // --------------------------------------------------------------------------------------
-  const BLOOM_LEVELS = 8;
+  const BLOOM_LEVELS = MOBILE ? 5 : 8;
   const linSamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
   const compUBO = mkBuf(32, GU.UNIFORM | GU.COPY_DST, 'composite ubo');
   const compData = new Float32Array(8);
@@ -340,6 +348,9 @@ async function main() {
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
   let W = 0, H = 0;
+  let renderScale = 1;
+  const adaptive = MOBILE && qs.get('adaptive') !== '0' && !qs.has('w') && !qs.has('h') && !qs.has('shot');
+  let bloomLevels = BLOOM_LEVELS;
   let colorMS, depthMS, hdrTex, bloomTex;
   const mainPass = {
     colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
@@ -353,27 +364,34 @@ async function main() {
 
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
-    const dpr = window.devicePixelRatio || 1;
-    const w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
-    const h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
+    const dpr = Math.min(window.devicePixelRatio || 1, MOBILE ? 1.5 : Infinity);
+    let w = fw > 0 ? fw : canvas.clientWidth * dpr;
+    let h = fh > 0 ? fh : canvas.clientHeight * dpr;
+    // Keep aspect ratio while bounding fill rate and the adapter's texture dimensions.
+    const fit = Math.min(1, device.limits.maxTextureDimension2D / Math.max(w, h),
+      MOBILE && !fw && !fh ? Math.sqrt(650000 / Math.max(1, w * h)) : 1);
+    w = Math.max(1, Math.floor(w * fit * renderScale));
+    h = Math.max(1, Math.floor(h * fit * renderScale));
     if (w === W && h === H) return;
     W = w; H = h;
     canvas.width = W; canvas.height = H;
     for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
-    colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    colorMS = MSAA > 1 ? device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT }) : null;
     depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
     const bw = Math.max(1, W >> 1), bh = Math.max(1, H >> 1);
-    bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: BLOOM_LEVELS, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
-    mainPass.colorAttachments[0].view = colorMS.createView();
-    mainPass.colorAttachments[0].resolveTarget = hdrTex.createView();
+    bloomLevels = Math.min(BLOOM_LEVELS, Math.floor(Math.log2(Math.max(bw, bh))) + 1);
+    bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: bloomLevels, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
+    mainPass.colorAttachments[0].view = (colorMS || hdrTex).createView();
+    mainPass.colorAttachments[0].resolveTarget = colorMS ? hdrTex.createView() : undefined;
+    mainPass.colorAttachments[0].storeOp = colorMS ? 'discard' : 'store';
     mainPass.depthStencilAttachment.view = depthMS.createView();
     const hdrView = hdrTex.createView();
     const bv = [];
-    for (let m = 0; m < BLOOM_LEVELS; m++) bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
+    for (let m = 0; m < bloomLevels; m++) bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
     downPasses = []; upPasses = []; downBGs = []; upBGs = [];
     const tmp = new Float32Array(4);
-    for (let m = 0; m < BLOOM_LEVELS; m++) {
+    for (let m = 0; m < bloomLevels; m++) {
       const srcW = m === 0 ? W : Math.max(1, bw >> (m - 1));
       const srcH = m === 0 ? H : Math.max(1, bh >> (m - 1));
       tmp[0] = 1 / srcW; tmp[1] = 1 / srcH; tmp[2] = m === 0 ? 1 : 0; tmp[3] = 0;
@@ -381,7 +399,7 @@ async function main() {
       downBGs.push(bg(downPipe, [m === 0 ? hdrView : bv[m - 1], linSamp, { buffer: bloomUBOs[m] }]));
       downPasses.push({ colorAttachments: [{ view: bv[m], clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
     }
-    for (let m = BLOOM_LEVELS - 1; m > 0; m--) {
+    for (let m = bloomLevels - 1; m > 0; m--) {
       const sw = Math.max(1, bw >> m), sh = Math.max(1, bh >> m);
       tmp[0] = 1 / sw; tmp[1] = 1 / sh; tmp[2] = 1.0; tmp[3] = 1.0;
       const ubo = bloomUBOs[BLOOM_LEVELS + m];
@@ -449,10 +467,21 @@ async function main() {
   }
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
   const keys = Object.create(null);
-  addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
+  const touch = { x: 0, y: 0, lift: 0 };
+  const touchDevice = matchMedia('(any-pointer: coarse)').matches;
+  document.documentElement.classList.toggle('touch', touchDevice);
+  if (touchDevice) document.querySelector('#hud .help').textContent = 'drag sea: look · left pad: move · arrows: height';
+  addEventListener('keydown', (e) => {
+    if (/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+    keys[e.code] = true;
+    if (e.code === 'KeyH' && !e.repeat) togglePanel();
+    if (e.code === 'Space') e.preventDefault();
+  });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
-  addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
+  canvas.addEventListener('click', (e) => {
+    if (e.pointerType === 'touch' || touchDevice || !canvas.requestPointerLock) return;
+    if (document.pointerLockElement !== canvas) canvas.requestPointerLock()?.catch(() => {});
+  });
   let dragging = false;
   canvas.addEventListener('mousedown', (e) => { if (e.button === 2) dragging = true; });
   addEventListener('mouseup', () => { dragging = false; });
@@ -463,16 +492,78 @@ async function main() {
       cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - e.movementY * 0.0022));
     }
   });
-  addEventListener('wheel', (e) => {
+  canvas.addEventListener('wheel', (e) => {
     cam.speed = Math.max(0.5, Math.min(400, cam.speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
   }, { passive: true });
+
+  // Independent pointer IDs allow moving, looking and changing height simultaneously.
+  const stick = document.getElementById('stick'), thumb = stick.firstElementChild;
+  let stickId = null, lookId = null, lookX = 0, lookY = 0, stickX = 0, stickY = 0;
+  const lifts = new Map();
+  function resetInput() {
+    for (const k in keys) keys[k] = false;
+    touch.x = touch.y = touch.lift = 0;
+    stickId = lookId = null;
+    lifts.clear();
+    dragging = false;
+    thumb.style.transform = '';
+  }
+  addEventListener('blur', resetInput);
+  function moveStick(e) {
+    if (e.pointerId !== stickId) return;
+    const x = (e.clientX - stickX) / 40, y = (e.clientY - stickY) / 40;
+    const d = Math.max(1, Math.hypot(x, y));
+    touch.x = x / d; touch.y = -y / d;
+    thumb.style.transform = `translate(${touch.x * 32}px, ${-touch.y * 32}px)`;
+  }
+  stick.addEventListener('pointerdown', (e) => {
+    if (stickId !== null) return;
+    e.preventDefault();
+    const r = stick.getBoundingClientRect();
+    stickX = r.left + r.width / 2; stickY = r.top + r.height / 2;
+    stickId = e.pointerId;
+    stick.setPointerCapture(e.pointerId);
+    moveStick(e);
+  });
+  stick.addEventListener('pointermove', moveStick);
+  function endStick(e) {
+    if (e.pointerId !== stickId) return;
+    stickId = null; touch.x = touch.y = 0; thumb.style.transform = '';
+  }
+  for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) stick.addEventListener(event, endStick);
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' || lookId !== null) return;
+    e.preventDefault();
+    lookId = e.pointerId; lookX = e.clientX; lookY = e.clientY;
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (e.pointerId !== lookId) return;
+    cam.yaw += (e.clientX - lookX) * 0.004;
+    cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - (e.clientY - lookY) * 0.004));
+    lookX = e.clientX; lookY = e.clientY;
+  });
+  for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+    canvas.addEventListener(event, (e) => { if (e.pointerId === lookId) lookId = null; });
+  }
+  for (const [id, direction] of [['rise', 1], ['sink', -1]]) {
+    const button = document.getElementById(id);
+    const updateLift = () => { touch.lift = Math.max(-1, Math.min(1, [...lifts.values()].reduce((a, b) => a + b, 0))); };
+    button.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); button.setPointerCapture(e.pointerId);
+      lifts.set(e.pointerId, direction); updateLift();
+    });
+    for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+      button.addEventListener(event, (e) => { lifts.delete(e.pointerId); updateLift(); });
+    }
+  }
 
   function updateCamera(dt) {
     const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
     let mx = 0, my = 0, mz = 0;
-    const fwd = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
-    const str = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
-    const up = (keys.KeyE || keys.Space ? 1 : 0) - (keys.KeyQ || keys.KeyC ? 1 : 0);
+    const fwd = Math.max(-1, Math.min(1, (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0) + touch.y));
+    const str = Math.max(-1, Math.min(1, (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0) + touch.x));
+    const up = Math.max(-1, Math.min(1, (keys.KeyE || keys.Space ? 1 : 0) - (keys.KeyQ || keys.KeyC ? 1 : 0) + touch.lift));
     mx += fwd * cp * sy + str * cy;
     my += fwd * sp + up;
     mz += -fwd * cp * cy + str * sy;
@@ -588,7 +679,7 @@ async function main() {
     f[68] = P.exposure; f[69] = P.bloom; f[70] = frameIndex; f[71] = DBG;
     f[72] = P.haze; f[73] = Math.max(cam.y, 10) * 0.001; f[74] = P.veil; f[75] = 0.9;
     // deep water body scatter colour (greenish coastal water), unresolved slope variance
-    f[76] = 0.016 * P.turbidity; f[77] = 0.080 * P.turbidity; f[78] = 0.096 * P.turbidity; f[79] = 0.0024;
+    f[76] = 0.016 * P.turbidity; f[77] = 0.080 * P.turbidity; f[78] = 0.096 * P.turbidity; f[79] = MOBILE ? 0.004 : 0.0024;
     f[80] = 0.035; f[81] = 0.120; f[82] = 0.085; f[83] = 2.6;
     f[84] = 0.36 + 0.12 * P.foam; f[85] = 2.5; f[86] = 1.0; f[87] = 1.0;
     f[88] = (5.802e-3 + 4.40e-3 * P.haze) * 1e-3;
@@ -603,7 +694,26 @@ async function main() {
   // UI
   // --------------------------------------------------------------------------------------
   const panel = document.getElementById('panel');
-  function togglePanel() { panel.classList.toggle('hidden'); }
+  const settings = document.getElementById('settings');
+  function togglePanel() {
+    const hidden = panel.classList.toggle('hidden');
+    document.documentElement.classList.toggle('panel-open', !hidden);
+    settings.setAttribute('aria-expanded', String(!hidden));
+    resetInput();
+    if (!hidden && document.pointerLockElement) document.exitPointerLock();
+  }
+  settings.addEventListener('click', togglePanel);
+  const qualityRow = document.createElement('label');
+  qualityRow.innerHTML = '<span>Quality</span><select aria-label="Quality"><option value="auto">Auto · 60 fps target</option><option value="mobile">Mobile · 60 fps target</option><option value="desktop">Desktop · full detail</option></select>';
+  const qualitySelect = qualityRow.querySelector('select');
+  qualitySelect.value = qs.get('quality') === 'mobile' || qs.get('quality') === 'desktop' ? qs.get('quality') : 'auto';
+  qualitySelect.addEventListener('change', () => {
+    const url = new URL(location.href);
+    if (qualitySelect.value === 'auto') url.searchParams.delete('quality');
+    else url.searchParams.set('quality', qualitySelect.value);
+    location.href = url.href;
+  });
+  panel.appendChild(qualityRow);
   const SLIDERS = [
     ['windSpeed', 'Wind speed (m/s)', 2, 20, 0.1, 'spec'],
     ['windDir', 'Wind direction (deg)', 0, 360, 1, 'spec'],
@@ -637,7 +747,12 @@ async function main() {
     row.append(name, inp, val);
     panel.appendChild(row);
   }
-  if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
+  if (qs.get('ui') === '0') {
+    document.getElementById('hud').style.display = 'none';
+    document.getElementById('touch-controls').style.display = 'none';
+    settings.style.display = 'none';
+    panel.classList.add('hidden');
+  }
   for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
 
   const hudFps = document.getElementById('fps');
@@ -652,8 +767,36 @@ async function main() {
   let shotIdx = 0;
   const fixedDt = shotName ? 1 / 60 : 0;
   let last = performance.now();
+  let nextFrameAt = last;
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
   let shooting = false;
+  let raf = 0, inFlight = 0, measuredFps = 0, lastAdapt = last + 2000, fastWindows = 0;
+  let skyAltitude = -Infinity;
+  const frameDone = () => { inFlight--; };
+  // Runtime diagnostics without scraping HUD text; frame counts submitted work, not RAF ticks.
+  window.oceanStats = Object.freeze({
+    get frame() { return frameIndex; },
+    get fps() { return measuredFps; },
+    get gpuMs() { return gpuMs; },
+    get width() { return W; },
+    get height() { return H; },
+    get scale() { return renderScale; },
+    get camera() { return { ...cam }; },
+    get inFlight() { return inFlight; },
+    profile: MOBILE ? 'mobile' : 'desktop', fft: N, cascades: C, foam: FOAM_RES, msaa: MSAA,
+    adaptive,
+  });
+  function adaptResolution(now) {
+    if (!adaptive || now - lastAdapt < 1000 || !measuredFps) return;
+    lastAdapt = now;
+    if (measuredFps < 54 || (gpuMs > 14.5 && hasTS)) {
+      renderScale = Math.max(0.6, renderScale * 0.85);
+      fastWindows = 0;
+    } else if (measuredFps > 58 && hasTS && gpuMs > 0 && gpuMs < 10.5) {
+      // Recover slowly, with hysteresis, so a borderline GPU does not resize every second.
+      if (++fastWindows >= 4) { renderScale = Math.min(1, renderScale + 0.05); fastWindows = 0; }
+    } else fastWindows = 0;
+  }
 
   function encodeSim(cp) {
     cp.setPipeline(evolvePipe);
@@ -706,16 +849,28 @@ async function main() {
   }
 
   function frame(now) {
-    if (shooting) return;  // paused while a screenshot is read back
-    requestAnimationFrame(frame);
+    raf = 0;
+    if (shooting || stopped || document.hidden) return;
+    raf = requestAnimationFrame(frame);
+    // Cap mobile submission at 60 on high-refresh displays; never queue an unbounded GPU backlog.
+    if (inFlight >= 2) return;
+    if (MOBILE && !fixedDt) {
+      if (now + 1 < nextFrameAt) return;
+      // Keep a deadline rather than measuring from the previous render: this preserves
+      // 60 fps on 90 Hz displays and avoids dropping a whole refresh after a small jitter.
+      nextFrameAt = Math.max(nextFrameAt + 1000 / 60, now);
+    }
+    adaptResolution(now);
     resize();
-    let dt = Math.min(0.1, (now - last) / 1000);
+    const elapsed = Math.max(0.0001, (now - last) / 1000);
+    let dt = Math.min(0.1, elapsed);
     last = now;
-    fpsAcc += dt; fpsN++; fpsT += dt;
+    fpsAcc += elapsed; fpsN++; fpsT += elapsed;
     if (fpsT > 0.5) {
       const fps = fpsN / fpsAcc;
+      measuredFps = fps;
       hudFps.textContent = `${fps.toFixed(0)} fps  ${(1000 / fps).toFixed(2)} ms` +
-        (hasTS ? `  |  GPU ${gpuMs.toFixed(2)} ms` : '') + `  |  ${nodeCount} nodes  ${W}x${H}`;
+        (hasTS ? `  |  GPU ${gpuMs.toFixed(2)} ms` : '') + `  |  ${MOBILE ? 'mobile' : 'desktop'}  ${W}x${H}`;
       fpsAcc = 0; fpsN = 0; fpsT = 0;
     }
     if (fixedDt) dt = fixedDt;
@@ -755,9 +910,14 @@ async function main() {
     cp.setPipeline(probePipe);
     cp.setBindGroup(0, bgProbe);
     cp.dispatchWorkgroups(1);
-    cp.setPipeline(skyViewPipe);
-    cp.setBindGroup(0, bgSkyView);
-    cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+    // The atmosphere LUT does not depend on camera yaw or moving clouds. Refresh on changes
+    // and altitude movement, rather than integrating the atmosphere on every mobile frame.
+    if (!MOBILE || envFull > 0 || Math.abs(cam.y - skyAltitude) > 5) {
+      cp.setPipeline(skyViewPipe);
+      cp.setBindGroup(0, bgSkyView);
+      cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+      skyAltitude = cam.y;
+    }
     cp.setPipeline(sunVisPipe);
     cp.setBindGroup(0, bgSunVis);
     cp.dispatchWorkgroups(1);
@@ -787,7 +947,7 @@ async function main() {
     rp.draw(3);
     rp.end();
 
-    for (let m = 0; m < BLOOM_LEVELS; m++) {
+    for (let m = 0; m < bloomLevels; m++) {
       const p = enc.beginRenderPass(downPasses[m]);
       p.setPipeline(downPipe);
       p.setBindGroup(0, downBGs[m]);
@@ -834,6 +994,8 @@ async function main() {
     }
     submitList[0] = enc.finish();
     device.queue.submit(submitList);
+    inFlight++;
+    device.queue.onSubmittedWorkDone().then(frameDone, frameDone);
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
     if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256, true);
@@ -863,15 +1025,30 @@ async function main() {
     log('shot saved ' + nm + ' gpu ' + gpuMs.toFixed(2) + 'ms nodes ' + nodeCount);
     shotIdx++;
     shooting = false;
-    if (shotIdx < shotSeq) { requestAnimationFrame(frame); return; }
+    if (shotIdx < shotSeq) { raf = requestAnimationFrame(frame); return; }
     if (shotSeq > 1) await fetch('/__shot?name=' + encodeURIComponent(shotName), { method: 'POST', body: blob });
     document.title = 'SHOT DONE';
-    if (qs.get('keep') === '1') requestAnimationFrame(frame);
+    if (qs.get('keep') === '1') raf = requestAnimationFrame(frame);
   }
 
   resize();
   addEventListener('resize', resize);
-  requestAnimationFrame(frame);
+  document.addEventListener('visibilitychange', () => {
+    resetInput();
+    if (document.hidden) { cancelAnimationFrame(raf); raf = 0; }
+    else if (!raf && !shooting && !stopped) {
+      last = performance.now();
+      fpsAcc = fpsN = fpsT = 0;
+      lastAdapt = last + 1000;
+      raf = requestAnimationFrame(frame);
+    }
+  });
+  raf = requestAnimationFrame(frame);
 }
 
-main().catch((e) => { log('init failed: ' + (e && e.stack || e)); });
+main().catch((e) => {
+  const el = document.getElementById('err');
+  el.style.display = 'block';
+  if (!el.textContent) el.textContent = 'Could not start the ocean renderer.\n' + (e.message || e);
+  log('init failed: ' + (e && e.stack || e));
+});

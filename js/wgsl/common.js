@@ -1,11 +1,16 @@
 // Shared constants and WGSL snippets.
-export const N = 256;          // FFT resolution per cascade
-export const LOGN = 8;
-export const CASCADES = 6;
-export const SKY_W = 256;      // sky-view LUT size
-export const SKY_H = 144;
-export const ENV_SIZE = 256;   // environment cube face size
-export const ENV_MIPS = 9;
+// Choose before shader templates are evaluated, so CPU allocations and WGSL always agree.
+// The URL override also makes the mobile path reproducible on a desktop GPU.
+const requestedQuality = new URLSearchParams(location.search).get('quality');
+export const MOBILE = requestedQuality === 'mobile' ||
+  (requestedQuality !== 'desktop' && matchMedia('(pointer: coarse)').matches);
+export const N = MOBILE ? 128 : 256;
+export const LOGN = Math.log2(N);
+export const CASCADES = MOBILE ? 4 : 6;
+export const SKY_W = MOBILE ? 128 : 256;
+export const SKY_H = MOBILE ? 72 : 144;
+export const ENV_SIZE = MOBILE ? 64 : 256;
+export const ENV_MIPS = Math.log2(ENV_SIZE) + 1;
 
 // Per-frame uniform block shared by every render / sky shader.
 // Layout must match the Float32Array offsets in main.js (FR_* constants).

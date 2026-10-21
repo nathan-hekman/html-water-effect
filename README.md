@@ -1,6 +1,8 @@
-# web-ocean
+# html-water-effect
 
-A real-time ocean renderer written from scratch on WebGPU, with no engine or rendering library. It draws a sunset sea with simulated waves, whitecaps, sun glitter, and a physically based sky with clouds. You fly around it with a free camera.
+A real-time WebGPU ocean effect with FFT waves, whitecaps, sun glitter, and an atmospheric sunset sky. Run it from source or use a self-contained HTML file. No rendering engine or runtime dependencies.
+
+Based on [Noniv/web-ocean](https://github.com/Noniv/web-ocean) by Maksymilian Dendura. This version adds a mobile quality profile, adaptive resolution, touch movement and look controls, and a 60 fps submission target. The original desktop quality profile remains available.
 
 ![Looking toward the sun from 2.4 m above the water](docs/front.jpg)
 
@@ -10,18 +12,31 @@ A real-time ocean renderer written from scratch on WebGPU, with no engine or ren
 
 ## Run it
 
-You need a recent Chrome with WebGPU and a reasonably capable GPU. On a laptop, force Chrome onto the dedicated GPU in the Windows graphics settings, or it will fall back to the integrated one.
+Public mobile demo: **https://web-ocean-mobile.pages.dev/**. Cloudflare Pages serves the self-contained build over HTTPS without a login or a running local server.
 
-Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (61 KB instead of 102 KB). Both are self-contained and work from `file://`.
+You need a browser and device with WebGPU support. Touch devices automatically use the mobile profile, which targets 60 fps with a smaller simulation and adaptive render resolution. Desktop devices retain the original full-detail profile. The settings button can override either profile.
+
+Open `ocean.html` directly in a browser that supports WebGPU on `file://`. `ocean.min.html` is the same self-contained page, minified. For a phone, host either page over **HTTPS**. An HTTP LAN URL is not a secure context and cannot run WebGPU; `localhost` only applies to the device running the browser.
 
 To run from source:
 
 ```
-npm install
+npm ci
 npm start        # serves http://localhost:8080/
 ```
 
 After editing anything under `js/`, run `npm run build` to regenerate both bundles. The minified build strips WGSL comments and whitespace and minifies the JavaScript with esbuild.
+
+To publish your own Cloudflare Pages demo after rebuilding:
+
+```sh
+mkdir -p output/cloudflare-pages
+cp ocean.min.html output/cloudflare-pages/index.html
+cp LICENSE output/cloudflare-pages/LICENSE
+npx wrangler pages deploy output/cloudflare-pages --project-name YOUR_PROJECT_NAME --branch main --commit-dirty=true
+```
+
+Replace `YOUR_PROJECT_NAME` with your Pages project name and sign Wrangler into the Cloudflare account that owns it. Only the generated page and license are uploaded. The live demo linked above uses direct uploads rather than automatic GitHub builds.
 
 ## Controls
 
@@ -34,10 +49,16 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 | Shift | 5x speed |
 | Mouse wheel | Change base speed |
 | H | Settings panel: wind, swell, choppiness, turbidity, foam, sun, haze, clouds, exposure, bloom |
+| Drag the sea on a touchscreen | Look around |
+| Left touch pad | Move forward/back and strafe; can be held while looking |
+| Touch arrows | Move up/down; can be held while moving and looking |
+| Settings button | Open/close the scrollable settings panel and choose quality |
 
 The camera keeps itself above the displaced water surface, so waves never pass through it.
 
 URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution, `cam=x,y,z,yawDeg,pitchDeg` sets the camera, `fov=deg` sets the field of view, `ui=0` hides the HUD, and any settings key works too, for example `windSpeed=12&swellHs=2&sunElev=8`.
+
+`?quality=mobile` forces the mobile profile, and `?quality=desktop` forces full detail. Auto uses the primary coarse-pointer media query. `adaptive=0` disables automatic resolution changes; an explicit `w` or `h`, or screenshot mode, also disables adaptation. Mobile rendering is capped at 60 submissions per second on high-refresh displays. Render dimensions are always bounded by the GPU texture limit, and small viewports use a valid bloom mip count.
 
 ## How it works
 
@@ -69,9 +90,29 @@ The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, Ag
 
 ## Performance
 
+### Mobile profile
+
+| Resource | Desktop | Mobile |
+|---|---|---|
+| FFT | 6 cascades × 256² | 4 cascades × 128² |
+| World-space foam | Two 1024² maps, ping-pong | Two 256² maps, ping-pong |
+| Surface grid | 32 × 32 quads per node | 16 × 16 quads per node |
+| MSAA | 4× | 1× |
+| Sky LUT / reflection face | 256 × 144 / 256² | 128 × 72 / 64² |
+| Bloom levels | Up to 8 | Up to 5 |
+| Resolution | Native device pixel ratio | At most 1.5 DPR and 650,000 pixels |
+
+The mobile profile lowers render scale when submitted frame rate falls below 54 fps or GPU time exceeds 14.5 ms. It recovers resolution slowly when timestamp queries show sustained headroom. Browsers without timestamp queries still reduce resolution using frame cadence. The scale floor is 60% in each dimension. FFT and foam storage fall by about 90%; short capillary waves and some near-surface geometry detail are traded for speed. The atmosphere LUT is reused until settings or camera altitude change. Cloud reflections continue updating round-robin.
+
+The renderer keeps at most two frames in flight and pauses GPU submission while the page is hidden. Touch release, cancellation, focus loss, and backgrounding clear movement state. Device loss and startup failures display a reload/error message.
+
+`window.oceanStats` exposes submitted frame count, FPS, GPU time, dimensions, scale, profile and camera for runtime measurements. Mobile emulation measures the host GPU; it does **not** prove 60 fps on a physical phone. Device capability, temperature, view direction and browser can change performance.
+
+### Original desktop measurement
+
 At 2560 by 1440 on an RTX 5070 Ti, the GPU takes about 6 to 8 ms per frame, measured while other programs were also using the GPU. The HUD shows FPS and GPU time when the browser supports `timestamp-query`.
 
-The per-frame code reuses preallocated typed arrays and descriptors, so the garbage collector has almost nothing to do. The only recurring allocations are the objects WebGPU itself requires, such as the swap-chain view and command buffers.
+The per-frame code reuses preallocated typed arrays and descriptors. Recurring allocations are primarily WebGPU handles, such as the swap-chain view and command buffers, and queue-completion promises used to bound frames in flight.
 
 ## Known limitations
 
@@ -80,9 +121,9 @@ The per-frame code reuses preallocated typed arrays and descriptors, so the garb
 - The scene is open ocean only. There is no shoreline, surf, or objects in the water.
 - Clouds are two flat layers, not volumetric.
 
-## How it was made
+## Credits
 
-I built this with Claude Code (Opus 5.5). I asked for the most realistic water it could produce, in WebGPU, with a floating camera, and left the architecture and implementation to it. It checked its own work by rendering screenshots in headless Chrome and having separate critic subagents review them, so it was not grading its own output. I gave feedback along the way, mainly on the clouds, which led to replacing the volumetric clouds with the flat layers and later fixing their edge aliasing.
+Maksymilian Dendura created the original WebGPU renderer and screenshots in [Noniv/web-ocean](https://github.com/Noniv/web-ocean). This repository preserves its commit history and MIT license. The mobile changes cover quality profiles, touch controls, render resolution, frame pacing, resource reuse, and browser lifecycle handling.
 
 ## Repository layout
 
@@ -97,4 +138,4 @@ I built this with Claude Code (Opus 5.5). I asked for the most realistic water i
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. Original copyright and permission notice are preserved in [LICENSE](LICENSE) and embedded in both self-contained HTML builds. Keep the notice when copying or redistributing the effect.

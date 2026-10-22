@@ -60,6 +60,31 @@ URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolut
 
 `?quality=mobile` forces the mobile profile, and `?quality=desktop` forces full detail. Auto uses the primary coarse-pointer media query. `adaptive=0` disables automatic resolution changes; an explicit `w` or `h`, or screenshot mode, also disables adaptation. Mobile rendering is capped at 60 submissions per second on high-refresh displays. Render dimensions are always bounded by the GPU texture limit, and small viewports use a valid bloom mip count.
 
+## Add a scene
+
+Set `globalThis.oceanExtension` before importing `js/main.js`. The async factory receives the WebGPU device, HDR format, MSAA count, shared frame uniform buffer, environment cube view/mip count, mutable parameters, canvas, mobile-profile flag, and `invalidate()` callback.
+
+```js
+globalThis.oceanExtension = async (engine) => {
+  // Create pipelines and buffers using engine.device.
+  return {
+    update(dt, camera, waterHeight) {
+      // Set camera.x/y/z, yaw, pitch and fovY (radians).
+      // Update scene simulation and GPU buffers.
+    },
+    draw(pass) {
+      // Draw into the ocean's HDR pass, after water and before sky.
+    },
+    get suspended() { return false; }, // true stops GPU submission until resumed
+  };
+};
+await import('./js/main.js');
+```
+
+Use `engine.format`, `engine.sampleCount`, and `depth32float` with reverse-Z (`depthCompare: 'greater'`). `engine.frameBuffer` uses the exported `FRAME_WGSL` layout from `js/wgsl/common.js`. Coordinates are metres; subtract the camera position before applying its view-projection matrix. The supplied environment cube provides the same sky lighting as the sea. Call `invalidate()` after changing parameters to rebuild the wave spectrum and atmosphere.
+
+An extension owns the camera; the standalone free-flight camera update and pointer lock are skipped. Keep the shell's HUD/settings/touch element IDs, or provide hidden compatibility nodes as the Titanic integration does. The renderer still initializes those controls. No extension means the original standalone behavior.
+
 ## How it works
 
 ### Waves
@@ -74,7 +99,7 @@ The surface mesh is a CDLOD quadtree with 17 levels. Vertices are 6.25 cm apart 
 
 - Mip-mapped first and second moments of the wave slopes (LEAN mapping) give the right anisotropic roughness at every distance. The sun glitter widens with distance and the far sea settles into a sheen without aliasing. Screen-space slope derivatives add specular anti-aliasing.
 - Sun glitter uses an anisotropic Gaussian slope distribution with Smith masking and the size of the solar disc.
-- The sky reflection comes from an environment cube map rebuilt every frame, with roughness-filtered mips. At grazing angles the reflection direction is tilted to account for which wave facets the viewer can actually see.
+- The sky reflection comes from an environment cube map updated one face per frame, with roughness-filtered mips. At grazing angles the reflection direction is tilted to account for which wave facets the viewer can actually see.
 - The water body is turbid blue-green, lit by the whole sky hemisphere. Backlit crests get a subsurface glow, and wind-gust patches modulate the short ripples.
 - Whitecaps start where the total surface Jacobian folds. Foam is stored in two camera-centred world-space maps (128 m and 1 km wide), decays over time, drifts downwind, and breaks into streaks as it ages. A procedural bubble texture gives it its structure.
 
@@ -86,7 +111,7 @@ Cloud noise octaves are filtered by pixel footprint, and silhouettes are anti-al
 
 ### Post-processing
 
-The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, AgX tone mapping, a slight white balance shift, and dithering.
+The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, AgX tone mapping, a slight white balance shift, and dithering. The downsample and additive upsample filters run in one compute pass using separate mip pyramids. The filter arithmetic and level count match the original raster implementation, which remains available with `?bloomPass=raster`. This avoids repeated render-pass stores on tile-based GPUs.
 
 ## Performance
 
@@ -104,9 +129,11 @@ The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, Ag
 
 The mobile profile lowers render scale when submitted frame rate falls below 54 fps or GPU time exceeds 14.5 ms. It recovers resolution slowly when timestamp queries show sustained headroom. Browsers without timestamp queries still reduce resolution using frame cadence. The scale floor is 60% in each dimension. FFT and foam storage fall by about 90%; short capillary waves and some near-surface geometry detail are traded for speed. The atmosphere LUT is reused until settings or camera altitude change. Cloud reflections continue updating round-robin.
 
+The atmosphere LUT retains full profile resolution and refreshes on parameter changes or camera altitude movement (25 cm desktop tolerance, 5 m mobile). Animated cloud reflections continue updating.
+
 The renderer keeps at most two frames in flight and pauses GPU submission while the page is hidden. Touch release, cancellation, focus loss, and backgrounding clear movement state. Device loss and startup failures display a reload/error message.
 
-`window.oceanStats` exposes submitted frame count, FPS, GPU time, dimensions, scale, profile and camera for runtime measurements. Mobile emulation measures the host GPU; it does **not** prove 60 fps on a physical phone. Device capability, temperature, view direction and browser can change performance.
+`window.oceanStats` exposes submitted frame count, FPS, total/compute/render/post GPU times, dimensions, scale, profile, bloom path and camera for runtime measurements. Mobile emulation measures the host GPU; it does **not** prove 60 fps on a physical phone. Device capability, temperature, view direction and browser can change performance.
 
 ### Original desktop measurement
 
@@ -118,7 +145,7 @@ The per-frame code reuses preallocated typed arrays and descriptors. Recurring a
 
 - Far water is still somewhat darker than the bright horizon sky above it.
 - The water is tuned toward turbid coastal water. The "Water turbidity" slider gives darker, bluer deep water when turned down.
-- The scene is open ocean only. There is no shoreline, surf, or objects in the water.
+- The standalone scene is open ocean only. Shorelines, surf, and floating objects require a scene extension.
 - Clouds are two flat layers, not volumetric.
 
 ## Credits

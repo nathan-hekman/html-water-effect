@@ -128,3 +128,25 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
   return vec4f(clamp(o, vec3f(0.0), vec3f(1.0)), 1.0);
 }
 `;
+
+// Identical bloom filter arithmetic in a single compute pass. Separate down/up
+// pyramids avoid read/write aliasing and tile render-pass stores on Apple GPUs.
+function computeFilter(source, up) {
+  const filter = source.slice(FS_TRI.length)
+    .replace(/@fragment\s+fn\s+fs\s*\(\s*in\s*:\s*VO\s*\)\s*->\s*@location\s*\(\s*0\s*\)\s*vec4f\s*\{/, 'fn bloomFilter(uv: vec2f) -> vec4f {')
+    .replace(/\blet\s+uv\s*=\s*in\.uv\s*;/, '');
+  return filter + `
+${up ? '@group(0) @binding(3) var base: texture_2d<f32>;' : ''}
+@group(0) @binding(${up ? 4 : 3}) var dst: texture_storage_2d<rgba16float, write>;
+@compute @workgroup_size(8,8) fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let dims = textureDimensions(dst);
+  if (any(gid.xy >= dims)) { return; }
+  let uv = (vec2f(gid.xy) + .5) / vec2f(dims);
+  var color = bloomFilter(uv);
+  ${up ? 'color += textureLoad(base, vec2i(gid.xy), 0);' : ''}
+  textureStore(dst, vec2i(gid.xy), color);
+}
+`;
+}
+export const BLOOM_DOWN_COMPUTE = computeFilter(BLOOM_DOWN, false);
+export const BLOOM_UP_COMPUTE = computeFilter(BLOOM_UP, true);

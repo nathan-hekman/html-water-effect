@@ -6,7 +6,7 @@ import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS, MOBILE } from './wgsl/co
 import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIPS, FOAM_UPDATE, ARRAY16_MIPS, FOAM_RES } from './wgsl/sim.js';
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
 import { OCEAN, SKY_BG, HEIGHT_PROBE } from './wgsl/ocean.js';
-import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
+import { BLOOM_DOWN, BLOOM_UP, BLOOM_DOWN_COMPUTE, BLOOM_UP_COMPUTE, COMPOSITE } from './wgsl/post.js';
 
 const qs = new URLSearchParams(location.search);
 const DBG = Number(qs.get('dbg')) || 0;
@@ -47,7 +47,9 @@ function fail(msg) {
 }
 function log(msg) {
   console.log(msg);
-  try { fetch('/__log', { method: 'POST', body: String(msg) }).catch(() => {}); } catch (e) { /* offline */ }
+  if (!globalThis.oceanExtension) {
+    try { fetch('/__log', { method: 'POST', body: String(msg) }).catch(() => {}); } catch (e) { /* offline */ }
+  }
 }
 
 // ----------------------------------------------------------------------------------------
@@ -64,6 +66,7 @@ function mat4Mul(out, a, b) {
 }
 
 async function main() {
+  const extension = globalThis.oceanExtension;
   if (!isSecureContext) fail('WebGPU needs a secure connection. Open this page over HTTPS (or localhost on this device).');
   if (!navigator.gpu) fail('WebGPU is not available. Use a browser and device with WebGPU support. Update Safari or Chrome, then try again.');
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
@@ -289,6 +292,11 @@ async function main() {
       targets: [{ format: HDR, blend: { color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' } } }],
     },
   });
+  const computeBloom = qs.get('bloomPass') !== 'raster';
+  const [downCompute, upCompute] = await Promise.all([
+    computePipe(BLOOM_DOWN_COMPUTE, 'bloom down compute'),
+    computePipe(BLOOM_UP_COMPUTE, 'bloom up compute'),
+  ]);
   const compPipe = await device.createRenderPipelineAsync({
     label: 'composite', layout: 'auto',
     vertex: { module: compMod, entryPoint: 'vs' },
@@ -351,7 +359,7 @@ async function main() {
   let renderScale = 1;
   const adaptive = MOBILE && qs.get('adaptive') !== '0' && !qs.has('w') && !qs.has('h') && !qs.has('shot');
   let bloomLevels = BLOOM_LEVELS;
-  let colorMS, depthMS, hdrTex, bloomTex;
+  let colorMS, depthMS, hdrTex, bloomTex, bloomUpTex;
   const mainPass = {
     colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
     depthStencilAttachment: { view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'discard' },
@@ -361,6 +369,7 @@ async function main() {
     timestampWrites: undefined,
   };
   let downPasses = [], upPasses = [], downBGs = [], upBGs = [], bgComp = null;
+  let downDispatches = [], upDispatches = [];
 
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
@@ -375,28 +384,34 @@ async function main() {
     if (w === W && h === H) return;
     W = w; H = h;
     canvas.width = W; canvas.height = H;
-    for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
+    for (const t of [colorMS, depthMS, hdrTex, bloomTex, bloomUpTex]) t && t.destroy();
     colorMS = MSAA > 1 ? device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT }) : null;
     depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
     const bw = Math.max(1, W >> 1), bh = Math.max(1, H >> 1);
     bloomLevels = Math.min(BLOOM_LEVELS, Math.floor(Math.log2(Math.max(bw, bh))) + 1);
-    bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: bloomLevels, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
+    bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: bloomLevels, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING | TU.STORAGE_BINDING });
+    bloomUpTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: bloomLevels, usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING });
     mainPass.colorAttachments[0].view = (colorMS || hdrTex).createView();
     mainPass.colorAttachments[0].resolveTarget = colorMS ? hdrTex.createView() : undefined;
     mainPass.colorAttachments[0].storeOp = colorMS ? 'discard' : 'store';
     mainPass.depthStencilAttachment.view = depthMS.createView();
     const hdrView = hdrTex.createView();
-    const bv = [];
-    for (let m = 0; m < bloomLevels; m++) bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
+    const bv = [], uv = [];
+    for (let m = 0; m < bloomLevels; m++) {
+      bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
+      uv.push(bloomUpTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
+    }
     downPasses = []; upPasses = []; downBGs = []; upBGs = [];
+    downDispatches = []; upDispatches = [];
     const tmp = new Float32Array(4);
     for (let m = 0; m < bloomLevels; m++) {
       const srcW = m === 0 ? W : Math.max(1, bw >> (m - 1));
       const srcH = m === 0 ? H : Math.max(1, bh >> (m - 1));
       tmp[0] = 1 / srcW; tmp[1] = 1 / srcH; tmp[2] = m === 0 ? 1 : 0; tmp[3] = 0;
       device.queue.writeBuffer(bloomUBOs[m], 0, tmp);
-      downBGs.push(bg(downPipe, [m === 0 ? hdrView : bv[m - 1], linSamp, { buffer: bloomUBOs[m] }]));
+      downBGs.push(bg(computeBloom ? downCompute : downPipe, [m === 0 ? hdrView : bv[m - 1], linSamp, { buffer: bloomUBOs[m] }, ...(computeBloom ? [bv[m]] : [])]));
+      downDispatches.push([Math.ceil(Math.max(1, bw >> m) / 8), Math.ceil(Math.max(1, bh >> m) / 8)]);
       downPasses.push({ colorAttachments: [{ view: bv[m], clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
     }
     for (let m = bloomLevels - 1; m > 0; m--) {
@@ -404,28 +419,36 @@ async function main() {
       tmp[0] = 1 / sw; tmp[1] = 1 / sh; tmp[2] = 1.0; tmp[3] = 1.0;
       const ubo = bloomUBOs[BLOOM_LEVELS + m];
       device.queue.writeBuffer(ubo, 0, tmp);
-      upBGs.push(bg(upPipe, [bv[m], linSamp, { buffer: ubo }]));
+      upBGs.push(bg(computeBloom ? upCompute : upPipe, [computeBloom && m < bloomLevels - 1 ? uv[m] : bv[m], linSamp, { buffer: ubo }, ...(computeBloom ? [bv[m - 1], uv[m - 1]] : [])]));
+      upDispatches.push([Math.ceil(Math.max(1, bw >> (m - 1)) / 8), Math.ceil(Math.max(1, bh >> (m - 1)) / 8)]);
       upPasses.push({ colorAttachments: [{ view: bv[m - 1], loadOp: 'load', storeOp: 'store' }] });
     }
-    bgComp = bg(compPipe, [hdrView, bv[0], linSamp, { buffer: compUBO }]);
+    bgComp = bg(compPipe, [hdrView, computeBloom && bloomLevels > 1 ? uv[0] : bv[0], linSamp, { buffer: compUBO }]);
   }
 
   // --------------------------------------------------------------------------------------
   // GPU timing
   // --------------------------------------------------------------------------------------
-  let tsQuery = null, tsResolve = null, tsRead = null, tsPending = false, gpuMs = 0;
+  let tsQuery = null, tsResolve = null, tsRead = null, tsPending = false, gpuMs = 0, computeMs = 0, renderMs = 0, postMs = 0;
   let firstPassTS = undefined;
   if (hasTS) {
-    tsQuery = device.createQuerySet({ type: 'timestamp', count: 2 });
-    tsResolve = mkBuf(16, GU.QUERY_RESOLVE | GU.COPY_SRC, 'ts resolve');
-    tsRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'ts read');
-    firstPassTS = { querySet: tsQuery, beginningOfPassWriteIndex: 0 };
-    compPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 1 };
+    tsQuery = device.createQuerySet({ type: 'timestamp', count: 4 });
+    tsResolve = mkBuf(32, GU.QUERY_RESOLVE | GU.COPY_SRC, 'ts resolve');
+    tsRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'ts read');
+    firstPassTS = { querySet: tsQuery, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 };
+    mainPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 2 };
+    compPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 3 };
   }
   const computeDesc = { timestampWrites: firstPassTS };
   const onTsMapped = () => {
     const t = new BigUint64Array(tsRead.getMappedRange());
-    const ms = Number(t[1] - t[0]) / 1e6;
+    const ms = Number(t[3] - t[0]) / 1e6;
+    const smooth = (old, delta) => old ? old * .8 + Number(delta) / 1e6 * .2 : Number(delta) / 1e6;
+    if (ms > 0 && ms < 1000) {
+      computeMs = smooth(computeMs, t[1] - t[0]);
+      renderMs = smooth(renderMs, t[2] - t[1]);
+      postMs = smooth(postMs, t[3] - t[2]);
+    }
     if (ms > 0 && ms < 1000) gpuMs = gpuMs ? gpuMs * 0.8 + ms * 0.2 : ms;
     tsRead.unmap();
     tsPending = false;
@@ -479,7 +502,7 @@ async function main() {
   });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   canvas.addEventListener('click', (e) => {
-    if (e.pointerType === 'touch' || touchDevice || !canvas.requestPointerLock) return;
+    if (extension || e.pointerType === 'touch' || touchDevice || !canvas.requestPointerLock) return;
     if (document.pointerLockElement !== canvas) canvas.requestPointerLock()?.catch(() => {});
   });
   let dragging = false;
@@ -755,6 +778,14 @@ async function main() {
   }
   for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
 
+  // Optional scene integration shares the ocean's HDR target, reverse-Z depth, lighting,
+  // and post-processing. The standalone demo remains unchanged when no hook is supplied.
+  const scene = extension ? await extension({
+    device, format: HDR, sampleCount: MSAA, frameBuffer: frameUBO,
+    environmentView: envCubeView, environmentMips: ENV_MIPS,
+    parameters: P, canvas, mobile: MOBILE,
+    invalidate: () => { needSpectrum = true; needLUT = true; envFull = 2; },
+  }) : null;
   const hudFps = document.getElementById('fps');
 
   // --------------------------------------------------------------------------------------
@@ -778,13 +809,16 @@ async function main() {
     get frame() { return frameIndex; },
     get fps() { return measuredFps; },
     get gpuMs() { return gpuMs; },
+    get computeMs() { return computeMs; },
+    get renderMs() { return renderMs; },
+    get postMs() { return postMs; },
     get width() { return W; },
     get height() { return H; },
     get scale() { return renderScale; },
     get camera() { return { ...cam }; },
     get inFlight() { return inFlight; },
     profile: MOBILE ? 'mobile' : 'desktop', fft: N, cascades: C, foam: FOAM_RES, msaa: MSAA,
-    adaptive,
+    adaptive, bloomPass: computeBloom ? 'compute' : 'raster',
   });
   function adaptResolution(now) {
     if (!adaptive || now - lastAdapt < 1000 || !measuredFps) return;
@@ -852,6 +886,7 @@ async function main() {
     raf = 0;
     if (shooting || stopped || document.hidden) return;
     raf = requestAnimationFrame(frame);
+    if (scene?.suspended) { last = now; return; }
     // Cap mobile submission at 60 on high-refresh displays; never queue an unbounded GPU backlog.
     if (inFlight >= 2) return;
     if (MOBILE && !fixedDt) {
@@ -874,7 +909,8 @@ async function main() {
       fpsAcc = 0; fpsN = 0; fpsT = 0;
     }
     if (fixedDt) dt = fixedDt;
-    updateCamera(dt);
+    if (scene) scene.update(dt, cam, waterH);
+    else updateCamera(dt);
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
     frameIndex++;
@@ -911,8 +947,9 @@ async function main() {
     cp.setBindGroup(0, bgProbe);
     cp.dispatchWorkgroups(1);
     // The atmosphere LUT does not depend on camera yaw or moving clouds. Refresh on changes
-    // and altitude movement, rather than integrating the atmosphere on every mobile frame.
-    if (!MOBILE || envFull > 0 || Math.abs(cam.y - skyAltitude) > 5) {
+    // and altitude movement. Desktop keeps a 25 cm altitude tolerance without reducing
+    // LUT resolution, spectrum detail, or the continuously animated cloud reflections.
+    if (envFull > 0 || Math.abs(cam.y - skyAltitude) > (MOBILE ? 5 : .25)) {
       cp.setPipeline(skyViewPipe);
       cp.setBindGroup(0, bgSkyView);
       cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
@@ -942,11 +979,26 @@ async function main() {
       rp.setIndexBuffer(idxBuf, 'uint16');
       rp.drawIndexed(GRID * GRID * 6, nodeCount);
     }
+    scene?.draw(rp);
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
     rp.end();
 
+    if (computeBloom) {
+      const bloomPass = enc.beginComputePass();
+      bloomPass.setPipeline(downCompute);
+      for (let m = 0; m < bloomLevels; m++) {
+        bloomPass.setBindGroup(0, downBGs[m]);
+        bloomPass.dispatchWorkgroups(...downDispatches[m]);
+      }
+      bloomPass.setPipeline(upCompute);
+      for (let i = 0; i < upBGs.length; i++) {
+        bloomPass.setBindGroup(0, upBGs[i]);
+        bloomPass.dispatchWorkgroups(...upDispatches[i]);
+      }
+      bloomPass.end();
+    } else {
     for (let m = 0; m < bloomLevels; m++) {
       const p = enc.beginRenderPass(downPasses[m]);
       p.setPipeline(downPipe);
@@ -960,6 +1012,7 @@ async function main() {
       p.setBindGroup(0, upBGs[i]);
       p.draw(3);
       p.end();
+    }
     }
 
     compData[0] = P.exposure; compData[1] = P.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
@@ -980,8 +1033,8 @@ async function main() {
     }
     let doTs = false;
     if (hasTS && !tsPending && (frameIndex & 7) === 0) {
-      enc.resolveQuerySet(tsQuery, 0, 2, tsResolve, 0);
-      enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 16);
+      enc.resolveQuerySet(tsQuery, 0, 4, tsResolve, 0);
+      enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 32);
       doTs = true;
     }
     let readBuf = null;
